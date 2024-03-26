@@ -97,8 +97,8 @@ def controlnet_api(_: gr.Blocks, app: FastAPI):
     ):
         controlnet_module = global_state.reverse_preprocessor_aliases.get(
             controlnet_module, controlnet_module
-        )
 
+        )
         if controlnet_module not in cached_cn_preprocessors:
             raise HTTPException(status_code=422, detail="Module not available")
 

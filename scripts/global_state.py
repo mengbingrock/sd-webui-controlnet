@@ -13,7 +13,7 @@ from scripts.enums import StableDiffusionVersion
 
 from typing import Dict, Callable, Optional, Tuple, List
 
-CN_MODEL_EXTS = [".pt", ".pth", ".ckpt", ".safetensors", ".bin"]
+CN_MODEL_EXTS = [".pt", ".pth", ".ckpt", ".safetensors", ".bin", ".trt"] # add trt engine
 cn_models_dir = os.path.join(models_path, "ControlNet")
 cn_models_dir_old = os.path.join(scripts.basedir(), "models")
 cn_models = OrderedDict()      # "My_Lora(abcd1234)" -> C:/path/to/model.safetensors
@@ -187,6 +187,7 @@ def traverse_all_files(curr_path, model_list):
     ]
     for f_info in f_list:
         fname, fstat = f_info
+        print('search for model file:', fname)
         if os.path.splitext(fname)[1] in CN_MODEL_EXTS:
             model_list.append(f_info)
         elif stat.S_ISDIR(fstat.st_mode):

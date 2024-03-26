@@ -150,6 +150,7 @@ def build_model_by_guess(state_dict, unet, model_path):
         state_dict = model
         del st_model
 
+    #print("build_model_by_guess: params  state_dict:", state_dict) 
     model_has_shuffle_in_filename = 'shuffle' in Path(os.path.abspath(model_path)).stem.lower()
     state_dict = {k.replace("control_model.", ""): v for k, v in state_dict.items()}
     state_dict = {k.replace("adapter.", ""): v for k, v in state_dict.items()}
@@ -199,6 +200,7 @@ def build_model_by_guess(state_dict, unet, model_path):
 
         network = PlugableControlModel(config, state_dict)
         network.to(devices.dtype_unet)
+        print("!!! controlnet_model_guesss.py: return PlugableControlModel")
         return network
 
     if 'conv_in.weight' in state_dict:

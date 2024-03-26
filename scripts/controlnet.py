@@ -317,6 +317,7 @@ class Script(scripts.Script, metaclass=(
 
     @staticmethod
     def build_control_model(p, unet, model):
+        #print('!!!!!!!!build_control_model params:', 'p=',p , 'unet=, too large to print', 'model=')
         if model is None or model == 'None':
             raise RuntimeError(f"You have not selected any ControlNet Model.")
 
@@ -337,6 +338,9 @@ class Script(scripts.Script, metaclass=(
 
         logger.info(f"Loading model: {model}")
         state_dict = load_state_dict(model_path)
+        
+        #print('!!!! build_control_model,state_dict=', state_dict)
+        #input('check state_dict')
         network = build_model_by_guess(state_dict, unet, model_path)
         network.to('cpu', dtype=p.sd_model.dtype)
         logger.info(f"ControlNet model {model} loaded.")
@@ -649,8 +653,10 @@ class Script(scripts.Script, metaclass=(
             raise Exception(f"ControlNet model {unit.model}({cnet_sd_version}) is not compatible with sd model({sd_version})")
 
     def controlnet_main_entry(self, p):
+        # unet
         sd_ldm = p.sd_model
         unet = sd_ldm.model.diffusion_model
+        # unet is the unet only, no contorlnet
         self.noise_modifier = None
 
         setattr(p, 'controlnet_control_loras', [])
@@ -678,6 +684,8 @@ class Script(scripts.Script, metaclass=(
             Script.clear_control_model_cache()
 
         for idx, unit in enumerate(self.enabled_units):
+            # idx is 0, 1, 2, which is the index of unet used
+            # unit is the ui class with parameters about which controlnet selected and input image
             unit.module = global_state.get_module_basename(unit.module)
 
         # unload unused preproc
@@ -688,6 +696,9 @@ class Script(scripts.Script, metaclass=(
 
         self.latest_model_hash = p.sd_model.sd_model_hash
         for idx, unit in enumerate(self.enabled_units):
+            print('!!!unit.model=', unit.model)
+            print('unit.module=', unit.module)
+            input()
             Script.bound_check_params(unit)
             Script.check_sd_version_compatible(unit)
 
@@ -699,6 +710,8 @@ class Script(scripts.Script, metaclass=(
             else:
                 model_net = Script.load_control_model(p, unet, unit.model)
                 model_net.reset()
+
+            # model_net is control_net
 
                 if getattr(model_net, 'is_control_lora', False):
                     control_lora = model_net.control_model
@@ -762,6 +775,7 @@ class Script(scripts.Script, metaclass=(
 
             high_res_fix = isinstance(p, StableDiffusionProcessingTxt2Img) and getattr(p, 'enable_hr', False)
 
+            print('!!! high_res_fix=', high_res_fix)
             h = (p.height // 8) * 8
             w = (p.width // 8) * 8
 
@@ -861,7 +875,7 @@ class Script(scripts.Script, metaclass=(
                 control_model=model_net,
                 preprocessor=preprocessor_dict,
                 hint_cond=control,
-                weight=unit.weight,
+                weight=unit.weight, # what is unit.weight?
                 guidance_stopped=False,
                 start_guidance_percent=unit.guidance_start,
                 stop_guidance_percent=unit.guidance_end,
@@ -874,6 +888,7 @@ class Script(scripts.Script, metaclass=(
             )
             forward_params.append(forward_param)
 
+            # adding post_processor
             if 'inpaint_only' in unit.module:
                 final_inpaint_feed = hr_control if hr_control is not None else control
                 final_inpaint_feed = final_inpaint_feed.detach().cpu().numpy()
@@ -953,15 +968,17 @@ class Script(scripts.Script, metaclass=(
         is_low_vram = any(unit.low_vram for unit in self.enabled_units)
 
         self.latest_network = UnetHook(lowvram=is_low_vram)
+        print('!!!! main entry: forward_params: cannot print')
         self.latest_network.hook(model=unet, sd_ldm=sd_ldm, control_params=forward_params, process=p)
+        input("check forward_params")
 
         for param in forward_params:
             if param.control_model_type == ControlModelType.IPAdapter:
                 param.control_model.hook(
                     model=unet,
                     clip_vision_output=param.hint_cond,
-                    weight=param.weight,
                     dtype=torch.float32,
+                    weight=param.weight,
                     start=param.start_guidance_percent,
                     end=param.stop_guidance_percent
                 )
@@ -973,9 +990,13 @@ class Script(scripts.Script, metaclass=(
                     start=param.start_guidance_percent,
                     end=param.stop_guidance_percent
                 )
+            print('!!! main entry: param=', 'param.control_model=PlugableControlModel', param.control_model_type)
+
+        
 
         self.detected_map = detected_maps
         self.post_processors = post_processors
+        input('finished main entry')
 
     def controlnet_hack(self, p):
         t = time.time()
@@ -989,8 +1010,12 @@ class Script(scripts.Script, metaclass=(
         return getattr(p, 'refiner_checkpoint', None) is not None
 
     def process(self, p, *args, **kwargs):
+        print('!!!controlnet Script.process called')
         if not Script.process_has_sdxl_refiner(p):
+            print('!!! not refiner')
             self.controlnet_hack(p)
+        else:
+            print('!!! has refiner')
         return
 
     def before_process_batch(self, p, *args, **kwargs):

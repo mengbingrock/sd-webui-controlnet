@@ -28,6 +28,8 @@ except:
     BasicTransformerBlockSGM = BasicTransformerBlock
 
 
+from scripts.trt_stable_diffusion_pipeline import Engine
+
 POSITIVE_MARK_TOKEN = 1024
 NEGATIVE_MARK_TOKEN = - POSITIVE_MARK_TOKEN
 MARK_EPS = 1e-3
@@ -337,6 +339,54 @@ class TorchCache:
         self.cache[self.hash(key)] = value
 
 
+import numpy as np
+import nvtx
+import onnx
+import tensorrt as trt
+import torch
+from cuda import cudart
+
+
+# Create CUDA events and stream
+events = {}
+markers = {}
+stream = cudart.cudaStreamCreate()[1]
+def loadResources(model, engine, stage,image_height, image_width, batch_size, seed):
+    global stream
+    # Initialize noise generator
+    generator = torch.Generator(device="cuda").manual_seed(seed) if seed else None
+
+    
+    events[stage] = [cudart.cudaEventCreate()[1], cudart.cudaEventCreate()[1]]
+    
+
+    # Allocate buffers for TensorRT engine bindings
+    print('!!! shape_dict', model.get_shape_dict(batch_size, image_height, image_width))
+    engine.allocate_buffers(shape_dict=model.get_shape_dict(batch_size, image_height, image_width), device='cuda')
+
+from scripts.trt_models import ControlNet, make_ControlNet, UNetC, make_UNetC
+from scripts.trt_utilities import PIPELINE_TYPE
+cmodel = make_ControlNet(controlnet='canny')
+cpath = '/localdisk/wangmengbing/TensorRT/demo/Diffusion/engine-cnet-depth1/canny.trt9.1.0.post12.dev4.plan'
+print('!!!init the canny engine')
+cengine = Engine(cpath)
+cengine.load()
+cengine.activate(reuse_device_memory=False)
+
+loadResources(cmodel,cengine,'cnet-stage' ,512, 512, 1, 0)
+
+print('!!!finish init the canny engine')
+
+print('!!! init the unet-c engine')
+unetcmodel = make_UNetC()
+unetcpath = '/localdisk/wangmengbing/TensorRT/demo/Diffusion/engine-cnet-depth1/unet-c.trt9.1.0.post12.dev4.plan'
+unetcengine = Engine(unetcpath)
+unetcengine.load()
+unetcengine.activate(reuse_device_memory=False)
+loadResources(unetcmodel, unetcengine, 'unet-c', 512, 512, 1, 0)
+
+
+
 class UnetHook(nn.Module):
     def __init__(self, lowvram=False) -> None:
         super().__init__()
@@ -401,6 +451,13 @@ class UnetHook(nn.Module):
         self.sd_ldm = sd_ldm
         self.control_params = control_params
 
+        print('!!! UnetHook.hook called')
+        print('!!! self.model=pytorch model, skip print')
+        print('!!! self.control_params=', self.control_params)
+        print('!!! precess=', process)
+        #import traceback, sys; traceback.print_stack(file=sys.stdout)
+        #input()
+
         model_is_sdxl = getattr(self.sd_ldm, 'is_sdxl', False)
 
         outer = self
@@ -420,6 +477,11 @@ class UnetHook(nn.Module):
             return process.sample_before_CN_hack(*args, **kwargs)
 
         def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
+            print("!!! UnetHook.forward called")
+            print('!!!, x.shape=', x.shape)
+            print("!!! context.shape(text cond)=:", context.shape, '\n y=', y, '\n kwargs=', kwargs) # kwargs = None, y = None, context = 1 tensor
+            import traceback, sys; traceback.print_stack(file=sys.stdout)
+            input('who call forward?')
             is_sdxl = y is not None and model_is_sdxl
             total_t2i_adapter_embedding = [0.0] * 4
             if is_sdxl:
@@ -510,6 +572,11 @@ class UnetHook(nn.Module):
                         param.control_model.to(devices.get_device_for("controlnet"))
 
             # handle prompt token control
+            # for each controlnet, ...
+            print('!!! len(outer.control_params)', len(outer.control_params))
+            
+            input('!!! check len of outer.control_params')
+
             for param in outer.control_params:
                 if no_high_res_control:
                     continue
@@ -518,13 +585,21 @@ class UnetHook(nn.Module):
                     continue
 
                 if param.control_model_type not in [ControlModelType.T2I_StyleAdapter]:
+                    print('continue!!! param.control_model_type(ControlModelType.ControlNet):',param.control_model_type, 'not in', '[ControlModelType.T2I_StyleAdapter]')
                     continue
 
+                # not processed in 
                 control = param.control_model(x=x, hint=param.used_hint_cond, timesteps=timesteps, context=context)
                 control = torch.cat([control.clone() for _ in range(batch_size)], dim=0)
                 control *= param.weight
                 control *= cond_mark[:, :, :, 0]
+                print('before cat, context=', context)
                 context = torch.cat([context, control.clone()], dim=1)
+                print('after cat, context=', context)
+                input('check context')
+
+                print(param.control_model.config)
+                input('!!!! check controlmodel config')
 
             # handle ControlNet / T2I_Adapter
             for param in outer.control_params:
@@ -536,6 +611,7 @@ class UnetHook(nn.Module):
 
                 if param.control_model_type not in [ControlModelType.ControlNet, ControlModelType.T2I_Adapter]:
                     continue
+                
 
                 # inpaint model workaround
                 x_in = x
@@ -551,15 +627,73 @@ class UnetHook(nn.Module):
 
                 hint = param.used_hint_cond
 
+                #import pdb; pdb.set_trace()
+
                 # ControlNet inpaint protocol
                 if hint.shape[1] == 4:
                     c = hint[:, 0:3, :, :]
                     m = hint[:, 3:4, :, :]
                     m = (m > 0.5).float()
                     hint = c * (1 - m) - m
+                print('!!! handle ControlNet / T2I_Adapter')
+                print('calling control_model, x=', x_in.shape)
+                print('hint=', hint.shape)
+                print('y is None',y == None)
+                print('context=', context.shape)
+                torch_infer = True
+                if torch_infer:
+                    # x_in [2, 4, 64, 64]: latent, hint [1, 3, 512, 512]: control img, context: text [2, 77, 768]
+                    control = param.control_model(x=x_in, hint=hint, timesteps=timesteps, context=context, y=y)
+                    # control has length 13
 
-                control = param.control_model(x=x_in, hint=hint, timesteps=timesteps, context=context, y=y)
+                # use tensorRT infer
+                else:
 
+                    params = {"sample": x_in, "timestep": timesteps[0], "encoder_hidden_states": context, 
+                              "controlnet_cond": torch.cat([hint]*2, dim = 0)}  # change 1 to batch_size later
+                    
+
+                    params.update({"conditioning_scale": 1.0})
+
+                    global stream
+                    print('!!!timestep.shape(force set shape to 1):',timesteps.shape, timesteps[0])
+                    input('check timestep shape and contents')
+                    ret_cnet = cengine.infer(params, stream)
+                    print('!!!len of ret_cnet=', ret_cnet.keys())
+                    input('check forward result!!!')
+                    control = []
+                    for name in cmodel.get_output_names():
+                        control.append(ret_cnet[name])
+
+                    
+                '''
+                (Pdb) control[0].shape
+                torch.Size([2, 320, 64, 64])
+                (Pdb) control[1].shape
+                torch.Size([2, 320, 64, 64])
+                (Pdb) control[2].shape
+                torch.Size([2, 320, 64, 64])
+                (Pdb) control[3].shape
+                torch.Size([2, 320, 32, 32])
+                (Pdb) control[4].shape
+                torch.Size([2, 640, 32, 32])
+                (Pdb) control[5].shape
+                torch.Size([2, 640, 32, 32])
+                (Pdb) control[6].shape
+                torch.Size([2, 640, 16, 16])
+                (Pdb) control[7].shape
+                torch.Size([2, 1280, 16, 16])
+                (Pdb) control[8].shape
+                torch.Size([2, 1280, 16, 16])
+                (Pdb) control[9].shape
+                torch.Size([2, 1280, 8, 8])
+                (Pdb) control[10].shape
+                torch.Size([2, 1280, 8, 8])
+                (Pdb) control[11].shape
+                torch.Size([2, 1280, 8, 8])
+                (Pdb) control[12].shape
+                torch.Size([2, 1280, 8, 8])
+                '''
                 if is_sdxl:
                     control_scales = [param.weight] * 10
                 else:
@@ -606,6 +740,7 @@ class UnetHook(nn.Module):
                         target = total_t2i_adapter_embedding
                     if target is not None:
                         target[idx] = item + target[idx]
+                # target holds control tensors for canny case: len(target) = 13, total_controlnet_embedding is also changed shadow copy
 
             # Replace x_t to support inpaint models
             for param in outer.control_params:
@@ -657,7 +792,8 @@ class UnetHook(nn.Module):
 
                 if param.guidance_stopped:
                     continue
-
+                
+                # skip for canny control
                 if param.used_hint_cond_latent is None:
                     continue
 
@@ -714,47 +850,82 @@ class UnetHook(nn.Module):
 
                 outer.attention_auto_machine = AutoMachine.Read
                 outer.gn_auto_machine = AutoMachine.Read
+            #torch_infer = True
+                
+            input('!!! Stop at Unet')
 
             # U-Net Encoder
             hs = []
-            with th.no_grad():
-                t_emb = cond_cast_unet(timestep_embedding(timesteps, self.model_channels, repeat_only=False))
-                emb = self.time_embed(t_emb)
+            h = None
+            
+            if torch_infer:
+                with th.no_grad():
+                    t_emb = cond_cast_unet(timestep_embedding(timesteps, self.model_channels, repeat_only=False))
+                    emb = self.time_embed(t_emb)
 
-                if is_sdxl:
-                    assert y.shape[0] == x.shape[0]
-                    emb = emb + self.label_emb(y)
+                    if is_sdxl:
+                        assert y.shape[0] == x.shape[0]
+                        emb = emb + self.label_emb(y)
+                    # x is latent image
+                    h = x
+                    # input_blocks has length 12, TimestepEmbedSequential
+                    for i, module in enumerate(self.input_blocks):
+                        self.current_h_shape = (h.shape[0], h.shape[1], h.shape[2], h.shape[3])
+                        h = module(h, emb, context)
 
-                h = x
-                for i, module in enumerate(self.input_blocks):
+                        t2i_injection = [3, 5, 8] if is_sdxl else [2, 5, 8, 11]
+
+                        if i in t2i_injection:
+                            h = aligned_adding(h, total_t2i_adapter_embedding.pop(0), require_inpaint_hijack)
+
+                        hs.append(h)
+                    
+                    print(f'!!! len of hs={len(hs)}')
+
                     self.current_h_shape = (h.shape[0], h.shape[1], h.shape[2], h.shape[3])
+                    h = self.middle_block(h, emb, context)
+            
+                # U-Net Middle Block
+                h = aligned_adding(h, total_controlnet_embedding.pop(), require_inpaint_hijack)
+
+                if len(total_t2i_adapter_embedding) > 0 and is_sdxl:
+                    h = aligned_adding(h, total_t2i_adapter_embedding.pop(0), require_inpaint_hijack)
+
+                # U-Net Decoder, downblocks of controlnet were added? len(self.output_blocks) = 12
+                for i, module in enumerate(self.output_blocks):
+                    self.current_h_shape = (h.shape[0], h.shape[1], h.shape[2], h.shape[3])
+                    h = th.cat([h, aligned_adding(hs.pop(), total_controlnet_embedding.pop(), require_inpaint_hijack)], dim=1)
                     h = module(h, emb, context)
 
-                    t2i_injection = [3, 5, 8] if is_sdxl else [2, 5, 8, 11]
+                # U-Net Output
+                h = h.type(x.dtype)
+                # h.shape = [2, 320, 64, 64]
+                print(h.shape)
+                h = self.out(h)
+                #h.shape = [2, 4, 64, 64]
+                print(h.shape)
+                #input('check h')
+            
+            else: # tensorRT infer
+                # delete the image params that the unet do not use
+                del params['controlnet_cond']
+                del params['conditioning_scale']
 
-                    if i in t2i_injection:
-                        h = aligned_adding(h, total_t2i_adapter_embedding.pop(0), require_inpaint_hijack)
+                for k,v in ret_cnet.items():
+                    if k in unetcmodel.get_input_names():
+                        params[k] = v
 
-                    hs.append(h)
+                noise_pred = unetcengine.infer(params, stream)['latent']
 
-                self.current_h_shape = (h.shape[0], h.shape[1], h.shape[2], h.shape[3])
-                h = self.middle_block(h, emb, context)
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
 
-            # U-Net Middle Block
-            h = aligned_adding(h, total_controlnet_embedding.pop(), require_inpaint_hijack)
+                # import pdb; pdb.set_trace()
+                
+                # noise_pred = noise_pred_uncond + guidance * (noise_pred_text - noise_pred_uncond)
+                h = noise_pred # ??? 
+                print('!!! unetc h.shape=', h.shape)
+                #input("check input")
 
-            if len(total_t2i_adapter_embedding) > 0 and is_sdxl:
-                h = aligned_adding(h, total_t2i_adapter_embedding.pop(0), require_inpaint_hijack)
-
-            # U-Net Decoder
-            for i, module in enumerate(self.output_blocks):
-                self.current_h_shape = (h.shape[0], h.shape[1], h.shape[2], h.shape[3])
-                h = th.cat([h, aligned_adding(hs.pop(), total_controlnet_embedding.pop(), require_inpaint_hijack)], dim=1)
-                h = module(h, emb, context)
-
-            # U-Net Output
-            h = h.type(x.dtype)
-            h = self.out(h)
 
             # Post-processing for color fix
             for param in outer.control_params:
@@ -809,6 +980,7 @@ class UnetHook(nn.Module):
                 w = max(0.0, min(1.0, float(param.weight)))
                 h = eps_prd * w + h * (1 - w)
 
+            # end of forward
             return h
 
         def move_all_control_model_to_cpu():
@@ -959,6 +1131,7 @@ class UnetHook(nn.Module):
             for module in enumerate(all_modules):
                 _original_inner_forward_cn_hijack = getattr(module, '_original_inner_forward_cn_hijack', None)
                 original_forward_cn_hijack = getattr(module, 'original_forward_cn_hijack', None)
+                #print('!!!unet hook','_original_inner_forward_cn_hijack=',_original_inner_forward_cn_hijack, 'original_forward_cn_hijack=', original_forward_cn_hijack)
                 if _original_inner_forward_cn_hijack is not None:
                     module._forward = _original_inner_forward_cn_hijack
                 if original_forward_cn_hijack is not None:
